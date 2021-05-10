@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -42,6 +43,9 @@ const (
 )
 
 var (
+	authUser             = kingpin.Flag("web.auth.username", "Basic auth username").Default("").String()
+	authPassword         = kingpin.Flag("web.auth.password", "Basic auth password").Default("").String()
+	disableClients       = kingpin.Flag("web.disable-clients", "Disable /clients endpoint").Default("false").Bool()
 	listenAddress        = kingpin.Flag("web.listen-address", "Address to listen on for proxy and client requests.").Default(":8080").String()
 	maxScrapeTimeout     = kingpin.Flag("scrape.max-timeout", "Any scrape with a timeout higher than this will have to be clamped to this.").Default("5m").Duration()
 	defaultScrapeTimeout = kingpin.Flag("scrape.default-timeout", "If a scrape lacks a timeout, use this value.").Default("15s").Duration()
@@ -92,6 +96,25 @@ type httpHandler struct {
 	proxy       http.Handler
 }
 
+func basicAuth(handler http.HandlerFunc) http.HandlerFunc {
+	if *authUser == "" && *authPassword == "" {
+		return handler
+	}
+	return func(w http.ResponseWriter, r *http.Request) {
+
+		user, pass, ok := r.BasicAuth()
+
+		if !ok || subtle.ConstantTimeCompare([]byte(user), []byte(*authUser)) != 1 || subtle.ConstantTimeCompare([]byte(pass), []byte(*authPassword)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Authentication required"`)
+			w.WriteHeader(401)
+			w.Write([]byte("Unauthorised.\n"))
+			return
+		}
+
+		handler(w, r)
+	}
+}
+
 func newHTTPHandler(logger log.Logger, coordinator *Coordinator, mux *http.ServeMux) *httpHandler {
 	h := &httpHandler{logger: logger, coordinator: coordinator, mux: mux}
 
@@ -99,9 +122,13 @@ func newHTTPHandler(logger log.Logger, coordinator *Coordinator, mux *http.Serve
 	handlers := map[string]http.HandlerFunc{
 		"/push":    h.handlePush,
 		"/poll":    h.handlePoll,
-		"/clients": h.handleListClients,
 		"/metrics": promhttp.Handler().ServeHTTP,
 	}
+
+	if !*disableClients {
+		handlers["/clients"] = basicAuth(h.handleListClients)
+	}
+
 	for path, handlerFunc := range handlers {
 		counter := httpAPICounter.MustCurryWith(prometheus.Labels{"path": path})
 		handler := promhttp.InstrumentHandlerCounter(counter, http.HandlerFunc(handlerFunc))
@@ -118,7 +145,7 @@ func newHTTPHandler(logger log.Logger, coordinator *Coordinator, mux *http.Serve
 	}
 
 	// proxy handler
-	h.proxy = promhttp.InstrumentHandlerCounter(httpProxyCounter, http.HandlerFunc(h.handleProxy))
+	h.proxy = promhttp.InstrumentHandlerCounter(httpProxyCounter, http.HandlerFunc(basicAuth(h.handleProxy)))
 
 	return h
 }
